@@ -71,7 +71,6 @@ export async function generateAssistantResponse(requestBody, callback) {
     throw new Error('没有可用的token，请运行 npm run login 获取token');
   }
   
-  const url = config.api.url;
   const headers = {
     'Host': config.api.host,
     'User-Agent': config.api.userAgent,
@@ -80,50 +79,70 @@ export async function generateAssistantResponse(requestBody, callback) {
     'Accept-Encoding': 'gzip'
   };
   
-  if (useNativeFetch) {
-    return await generateWithNativeFetch(url, headers, requestBody, callback, token);
-  }
-  
-  const streamResponse = requester.antigravity_fetchStream(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(requestBody)
-  });
-
   const state = { thinkingStarted: false, toolCalls: [] };
   let buffer = '';
-  let errorBody = '';
-  let statusCode = null;
+  
+  const processChunk = (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    lines.forEach(line => processStreamLine(line, state, callback));
+  };
+  
+  if (useNativeFetch) {
+    const response = await fetch(config.api.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody)
+    });
 
-  await new Promise((resolve, reject) => {
-    streamResponse
-      .onStart(({ status }) => {
-        statusCode = status;
-        if (status === 403) tokenManager.disableCurrentToken(token);
-      })
-      .onData((chunk) => {
-        if (statusCode !== 200) {
-          errorBody += chunk;
-          return;
-        }
-        
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        
-        lines.forEach(line => processStreamLine(line, state, callback));
-      })
-      .onEnd(() => {
-        if (statusCode === 403) {
-          reject(new Error(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`));
-        } else if (statusCode !== 200) {
-          reject(new Error(`API请求失败 (${statusCode}): ${errorBody}`));
-        } else {
-          resolve();
-        }
-      })
-      .onError(reject);
-  });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      if (response.status === 403) tokenManager.disableCurrentToken(token);
+      throw new Error(`API请求失败 (${response.status}): ${errorBody}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      processChunk(decoder.decode(value, { stream: true }));
+    }
+  } else {
+    const streamResponse = requester.antigravity_fetchStream(config.api.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody)
+    });
+
+    let errorBody = '';
+    let statusCode = null;
+
+    await new Promise((resolve, reject) => {
+      streamResponse
+        .onStart(({ status }) => {
+          statusCode = status;
+          if (status === 403) tokenManager.disableCurrentToken(token);
+        })
+        .onData((chunk) => {
+          if (statusCode !== 200) {
+            errorBody += chunk;
+          } else {
+            processChunk(chunk);
+          }
+        })
+        .onEnd(() => {
+          if (statusCode !== 200) {
+            reject(new Error(`API请求失败 (${statusCode}): ${errorBody}`));
+          } else {
+            resolve();
+          }
+        })
+        .onError(reject);
+    });
+  }
 }
 
 export async function getAvailableModels() {
@@ -133,15 +152,18 @@ export async function getAvailableModels() {
     throw new Error('没有可用的token，请运行 npm run login 获取token');
   }
   
-  const response = await fetch(config.api.modelsUrl, {
+  const headers = {
+    'Host': config.api.host,
+    'User-Agent': config.api.userAgent,
+    'Authorization': `Bearer ${token.access_token}`,
+    'Content-Type': 'application/json',
+    'Accept-Encoding': 'gzip'
+  };
+  
+  const fetchFn = useNativeFetch ? fetch : (url, opts) => requester.antigravity_fetch(url, opts);
+  const response = await fetchFn(config.api.modelsUrl, {
     method: 'POST',
-    headers: {
-      'Host': config.api.host,
-      'User-Agent': config.api.userAgent,
-      'Authorization': `Bearer ${token.access_token}`,
-      'Content-Type': 'application/json',
-      'Accept-Encoding': 'gzip'
-    },
+    headers,
     body: JSON.stringify({})
   });
 
@@ -158,38 +180,7 @@ export async function getAvailableModels() {
   };
 }
 
-async function generateWithNativeFetch(url, headers, requestBody, callback, token) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(requestBody)
-  });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    if (response.status === 403) {
-      tokenManager.disableCurrentToken(token);
-      throw new Error(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`);
-    }
-    throw new Error(`API请求失败 (${response.status}): ${errorBody}`);
-  }
-
-  const state = { thinkingStarted: false, toolCalls: [] };
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop();
-
-    lines.forEach(line => processStreamLine(line, state, callback));
-  }
-}
 
 export async function generateAssistantResponseNoStream(requestBody) {
   const token = await tokenManager.getToken();
@@ -198,19 +189,21 @@ export async function generateAssistantResponseNoStream(requestBody) {
     throw new Error('没有可用的token，请运行 npm run login 获取token');
   }
   
-  const response = await fetch(config.api.noStreamUrl, {
+  const headers = {
+    'Host': config.api.host,
+    'User-Agent': config.api.userAgent,
+    'Authorization': `Bearer ${token.access_token}`,
+    'Content-Type': 'application/json',
+    'Accept-Encoding': 'gzip'
+  };
+  
+  const fetchFn = useNativeFetch ? fetch : (url, opts) => requester.antigravity_fetch(url, opts);
+  const response = await fetchFn(config.api.noStreamUrl, {
     method: 'POST',
-    headers: {
-      'Host': config.api.host,
-      'User-Agent': config.api.userAgent,
-      'Authorization': `Bearer ${token.access_token}`,
-      'Content-Type': 'application/json',
-      'Accept-Encoding': 'gzip'
-    },
+    headers,
     body: JSON.stringify(requestBody)
   });
-
-  if (!response.ok) {
+  if (response.status !== 200) {
     const errorBody = await response.text();
     if (response.status === 403) {
       tokenManager.disableCurrentToken(token);
