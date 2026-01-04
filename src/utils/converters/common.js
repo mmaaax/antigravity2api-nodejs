@@ -29,7 +29,7 @@ export function getSignatureContext(sessionId, actualModelName) {
 export function pushUserMessage(extracted, antigravityMessages) {
   antigravityMessages.push({
     role: 'user',
-    parts: [{ text: extracted.text }, ...extracted.images]
+    parts: [{ text: extracted?.text || ' ' }, ...extracted.images]
   });
 }
 
